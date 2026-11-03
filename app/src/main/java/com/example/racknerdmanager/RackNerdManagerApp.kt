@@ -1,6 +1,13 @@
 package com.example.racknerdmanager
 
+import android.annotation.SuppressLint
 import android.content.ClipData
+import android.webkit.CookieManager
+import android.webkit.WebChromeClient
+import android.webkit.WebSettings
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import androidx.compose.ui.viewinterop.AndroidView
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.SharedPreferences
@@ -449,6 +456,7 @@ fun RackNerdAppScreen(viewModel: RackNerdViewModel) {
     val context = LocalContext.current
     var editingNode by remember { mutableStateOf<RackNerdNodeConfig?>(null) }
     var showAddDialog by remember { mutableStateOf(false) }
+    var webPanelNode by remember { mutableStateOf<RackNerdNodeConfig?>(null) }
 
     LaunchedEffect(uiState.toastMessage) {
         uiState.toastMessage?.let {
@@ -458,6 +466,20 @@ fun RackNerdAppScreen(viewModel: RackNerdViewModel) {
     }
 
     val selectedNode = uiState.nodes.find { it.id == uiState.selectedNodeId }
+
+    if (webPanelNode != null) {
+        val node = webPanelNode!!
+        val nodeStatus = uiState.statusMap[node.id]
+        InAppReinstallPanelScreen(
+            node = node,
+            status = nodeStatus,
+            onClose = {
+                webPanelNode = null
+                viewModel.refreshSingleNode(node)
+            }
+        )
+        return
+    }
 
     Scaffold(
         topBar = {
@@ -536,6 +558,7 @@ fun RackNerdAppScreen(viewModel: RackNerdViewModel) {
                     status = uiState.statusMap[selectedNode.id],
                     isActionLoading = uiState.isActionLoading,
                     onPowerAction = { action -> viewModel.executePowerAction(selectedNode, action) },
+                    onOpenReinstallPanel = { webPanelNode = selectedNode },
                     onEditNode = { editingNode = selectedNode },
                     onRemoveNode = { viewModel.removeNode(selectedNode.id) }
                 )
@@ -737,11 +760,13 @@ fun NodeDetailScreen(
     status: RackNerdNodeStatus?,
     isActionLoading: Boolean,
     onPowerAction: (String) -> Unit,
+    onOpenReinstallPanel: () -> Unit,
     onEditNode: () -> Unit,
     onRemoveNode: () -> Unit
 ) {
     val context = LocalContext.current
     var showRemoveConfirm by remember { mutableStateOf(false) }
+    var showDdDialog by remember { mutableStateOf(false) }
 
     Column(
         modifier = Modifier
@@ -869,6 +894,40 @@ fun NodeDetailScreen(
                         Text("关机")
                     }
                 }
+
+                Spacer(modifier = Modifier.height(12.dp))
+                HorizontalDivider()
+                Spacer(modifier = Modifier.height(12.dp))
+
+                Text(
+                    text = "注：SolusVM 客户端 API 仅开放开关机与状态查询，重装系统可通过下方「内置面板」直接选镜像重装，或生成一键 DD 脚本：",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(modifier = Modifier.height(10.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Button(
+                        onClick = onOpenReinstallPanel,
+                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondary),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(Icons.Default.SystemUpdateAlt, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("内置面板重装")
+                    }
+                    OutlinedButton(
+                        onClick = { showDdDialog = true },
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(Icons.Default.Terminal, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("SSH DD 重装命令")
+                    }
+                }
                 AnimatedVisibility(visible = isActionLoading) {
                     LinearProgressIndicator(
                         modifier = Modifier
@@ -969,6 +1028,243 @@ fun NodeDetailScreen(
             }
         )
     }
+
+    if (showDdDialog) {
+        DdReinstallHelperDialog(
+            onDismiss = { showDdDialog = false }
+        )
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@SuppressLint("SetJavaScriptEnabled")
+@Composable
+fun InAppReinstallPanelScreen(
+    node: RackNerdNodeConfig,
+    status: RackNerdNodeStatus?,
+    onClose: () -> Unit
+) {
+    val context = LocalContext.current
+    var isLoadingPage by remember { mutableStateOf(true) }
+    var webViewRef by remember { mutableStateOf<WebView?>(null) }
+
+    val panelUrl = remember(node.endpoint) {
+        val raw = node.endpoint.trim().trimEnd('/')
+        if (raw.endsWith("/api/client/command.php")) {
+            raw.removeSuffix("/api/client/command.php")
+        } else {
+            raw
+        }
+    }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = {
+                    Column {
+                        Text("内置控制面板 (重装系统 / VNC)", fontWeight = FontWeight.Bold)
+                        Text(
+                            text = "目标 IP: ${status?.ipAddress?.ifBlank { "-" } ?: "-"} (${status?.hostname?.ifBlank { node.alias } ?: node.alias})",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                },
+                navigationIcon = {
+                    IconButton(onClick = onClose) {
+                        Icon(Icons.Default.Close, contentDescription = "关闭面板")
+                    }
+                },
+                actions = {
+                    if (!status?.ipAddress.isNullOrBlank()) {
+                        IconButton(
+                            onClick = {
+                                val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                clipboard.setPrimaryClip(ClipData.newPlainText("IP", status?.ipAddress))
+                                Toast.makeText(context, "已复制当前主机 IP: ${status?.ipAddress}", Toast.LENGTH_SHORT).show()
+                            }
+                        ) {
+                            Icon(Icons.Default.ContentCopy, contentDescription = "复制主机 IP")
+                        }
+                    }
+                    IconButton(onClick = { webViewRef?.reload() }) {
+                        Icon(Icons.Default.Refresh, contentDescription = "刷新网页")
+                    }
+                }
+            )
+        }
+    ) { innerPadding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(innerPadding)
+        ) {
+            if (isLoadingPage) {
+                LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+            }
+            Surface(
+                color = MaterialTheme.colorScheme.secondaryContainer,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text(
+                    text = "提示：首次登录面板后会自动保存登录状态；点进对应机器点击「Reinstall」即可选择 Ubuntu / Debian / CentOS 等系统镜像一键重装。",
+                    style = MaterialTheme.typography.labelSmall,
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
+                )
+            }
+            AndroidView(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f),
+                factory = { ctx ->
+                    WebView(ctx).apply {
+                        CookieManager.getInstance().setAcceptCookie(true)
+                        CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+                        settings.apply {
+                            javaScriptEnabled = true
+                            domStorageEnabled = true
+                            databaseEnabled = true
+                            useWideViewPort = true
+                            loadWithOverviewMode = true
+                            builtInZoomControls = true
+                            displayZoomControls = false
+                            mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+                        }
+                        webViewClient = object : WebViewClient() {
+                            override fun onPageFinished(view: WebView?, url: String?) {
+                                isLoadingPage = false
+                                CookieManager.getInstance().flush()
+                            }
+                        }
+                        webChromeClient = WebChromeClient()
+                        loadUrl(panelUrl)
+                        webViewRef = this
+                    }
+                }
+            )
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun DdReinstallHelperDialog(
+    onDismiss: () -> Unit
+) {
+    val context = LocalContext.current
+    val osOptions = listOf(
+        "debian 12" to "Debian 12 (Bookworm - 推荐)",
+        "debian 11" to "Debian 11 (Bullseye)",
+        "ubuntu 24.04" to "Ubuntu 24.04 LTS",
+        "ubuntu 22.04" to "Ubuntu 22.04 LTS",
+        "almalinux 9" to "AlmaLinux 9",
+        "alpine" to "Alpine Linux (极简省内存)"
+    )
+    var selectedOs by remember { mutableStateOf(osOptions.first()) }
+    var rootPwd by remember { mutableStateOf("RackNerd2026!") }
+    var sshPort by remember { mutableStateOf("22") }
+    var expanded by remember { mutableStateOf(false) }
+
+    val commandText = remember(selectedOs, rootPwd, sshPort) {
+        "curl -O https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh && bash reinstall.sh ${selectedOs.first} --password '${rootPwd}' --ssh-port ${sshPort.ifBlank { "22" }} && reboot"
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        icon = { Icon(Icons.Default.Terminal, contentDescription = null) },
+        title = { Text("一键 DD 重装系统命令生成") },
+        text = {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text(
+                    text = "如果你习惯通过 SSH 终端快速纯净重装，可在下方选择目标系统与新密码，一键复制命令到 SSH 中执行：",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+
+                ExposedDropdownMenuBox(
+                    expanded = expanded,
+                    onExpandedChange = { expanded = !expanded }
+                ) {
+                    OutlinedTextField(
+                        value = selectedOs.second,
+                        onValueChange = {},
+                        readOnly = true,
+                        label = { Text("目标操作系统") },
+                        trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
+                        modifier = Modifier
+                            .menuAnchor()
+                            .fillMaxWidth()
+                    )
+                    ExposedDropdownMenu(
+                        expanded = expanded,
+                        onDismissRequest = { expanded = false }
+                    ) {
+                        osOptions.forEach { item ->
+                            DropdownMenuItem(
+                                text = { Text(item.second) },
+                                onClick = {
+                                    selectedOs = item
+                                    expanded = false
+                                }
+                            )
+                        }
+                    }
+                }
+
+                OutlinedTextField(
+                    value = rootPwd,
+                    onValueChange = { rootPwd = it },
+                    label = { Text("重装后的新 Root 密码") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                OutlinedTextField(
+                    value = sshPort,
+                    onValueChange = { sshPort = it },
+                    label = { Text("SSH 端口") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF0F172A)),
+                    shape = RoundedCornerShape(8.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = commandText,
+                        color = Color(0xFF38BDF8),
+                        fontFamily = FontFamily.Monospace,
+                        style = MaterialTheme.typography.labelSmall,
+                        modifier = Modifier.padding(10.dp)
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                    clipboard.setPrimaryClip(ClipData.newPlainText("DD Reinstall Command", commandText))
+                    Toast.makeText(context, "一键重装命令已复制！请粘贴到 SSH 终端运行", Toast.LENGTH_LONG).show()
+                    onDismiss()
+                }
+            ) {
+                Icon(Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(modifier = Modifier.width(6.dp))
+                Text("复制重装命令")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("关闭")
+            }
+        }
+    )
 }
 
 @Composable
